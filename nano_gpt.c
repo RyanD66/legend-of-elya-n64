@@ -51,7 +51,7 @@ static inline int16_t fp_add_sat(int32_t acc)
  * float16 decode (weights are stored as IEEE 754 half-precision scales)
  * Returns Q8.7 fixed-point (multiply this by raw Q4 nibble)
  * ----------------------------------------------------------------------- */
-static int16_t f16_to_fp_scale(uint16_t f16)
+static int32_t f16_to_fp_scale(uint16_t f16)
 {
     /* Python/numpy stores float16 as little-endian (x86 native).
      * N64 is big-endian: byte-swap before decoding. */
@@ -79,11 +79,15 @@ static int16_t f16_to_fp_scale(uint16_t f16)
     }
     if (sign) val = -val;
 
-    /* Convert to Q8.7: clamp to int16 range */
-    int32_t fixed = (int32_t)(val * FP_SCALE);
-    if (fixed > 32767) fixed = 32767;
-    if (fixed < -32768) fixed = -32768;
-    return (int16_t)fixed;
+    /* Convert to Q1.14 (val * FP_SCALE * FP_SCALE = val * 16384).
+     * q8_dequant does: (w * scale) >> 7 = w * val * 16384 / 128 = w * val * 128
+     * which is the correct Q8.7 dequantized value.
+     * Using FP_SCALE (128) here loses precision: scale = val * 128 rounds to 0 or 1
+     * for typical layer scales (bm/127 ~ 0.008), zeroing all weights. */
+    int32_t fixed = (int32_t)(val * (FP_SCALE * FP_SCALE));
+    if (fixed > 2097151) fixed = 2097151;
+    if (fixed < -2097152) fixed = -2097152;
+    return fixed;
 }
 
 /* -----------------------------------------------------------------------
@@ -97,11 +101,14 @@ static inline int16_t q8_dequant(const int8_t *packed, const uint16_t *scales, i
 {
     int8_t  w     = packed[idx];              /* signed: -128..+127 */
     int     block = idx / SGAI_Q_BLOCK;
-    int16_t scale = f16_to_fp_scale(scales[block]);
+    int32_t scale = f16_to_fp_scale(scales[block]); /* Q1.14: val * 16384 */
 
-    /* w * scale: w in [-128,127], scale in Q8.7.
-     * Product is Q16.14 (int32); >>7 to get Q8.7. */
-    return (int16_t)(((int32_t)w * (int32_t)scale) >> 7);
+    /* w * scale: w in [-128,127], scale = val * 16384 (Q1.14).
+     * Product = w * val * 16384; >>7 gives w * val * 128 = Q8.7 result. */
+    int32_t result = ((int32_t)w * scale) >> 7;
+    if (result > 32767) result = 32767;
+    if (result < -32768) result = -32768;
+    return (int16_t)result;
 }
 
 /* -----------------------------------------------------------------------
@@ -524,9 +531,12 @@ void sgai_init(SGAIState *state, const void *rom_weights)
          * Python: struct.pack('<I', 0x53454149) -> bytes [0x49,0x41,0x45,0x53]
          * N64 reads as BE: 0x49414553  (byte-swapped from SGAI_MAGIC)       */
         uint32_t m = hdr->magic;
-        uint32_t m_host = ((m & 0xFF000000u) >> 24) | ((m & 0x00FF0000u) >> 8)
-                        | ((m & 0x0000FF00u) <<  8) | ((m & 0x000000FFu) << 24);
-        if (m_host == SGAI_MAGIC) {
+        /* Python writes struct.pack('<I', 0x49414553) -> bytes [53,45,41,49] in file.
+         * N64 (big-endian) reads those bytes as 0x53454149 = SGAI_MAGIC directly.
+         * No byte-swap needed — the LE Python constant was chosen so that the
+         * big-endian N64 read equals SGAI_MAGIC. Previous byte-swap was inverting
+         * a passing check into a permanent fail, keeping model in demo mode. */
+        if (m == SGAI_MAGIC) {
             state->weights = hdr;
             state->is_loaded = 1;
         }
