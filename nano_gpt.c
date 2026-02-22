@@ -2,8 +2,8 @@
  * nano_gpt.c - Sophia Elya AI: World's First N64 LLM
  *
  * nano-GPT inference engine for N64 (MIPS R4300i + RSP)
- * Model: 2 layers, 128 embedding dim, 4 heads, vocab=256, ctx=32
- * Weights: Q4 quantized (2 nibbles/byte), scales in float16 per 32-block
+ * Model: 4 layers, 128 embedding dim, 4 heads, vocab=256, ctx=64
+ * Weights: Q8 quantized (int8 per weight), scales in float16 per 32-block
  * Activations: Q8.7 fixed-point (int16_t, 1.0 = 128)
  *
  * RSP acceleration strategy:
@@ -12,10 +12,10 @@
  *   - Process dot products in blocks of 8 (RSP vector width)
  *
  * Memory budget (8MB RDRAM):
- *   - Weights in ROM (DMA'd on demand): ~140KB
- *   - KV cache (SGAIKVCache): 2*32*128*2 * 2 = 32KB
+ *   - Weights in ROM (DMA'd on demand): ~784KB
+ *   - KV cache (SGAIKVCache): 4*64*128*2 * 2 = 131KB
  *   - Activations (x, logits, scratch): ~3KB
- *   - Total: well under 64KB working set
+ *   - wbuf: 1MB
  */
 
 #include "nano_gpt.h"
@@ -53,6 +53,9 @@ static inline int16_t fp_add_sat(int32_t acc)
  * ----------------------------------------------------------------------- */
 static int16_t f16_to_fp_scale(uint16_t f16)
 {
+    /* Python/numpy stores float16 as little-endian (x86 native).
+     * N64 is big-endian: byte-swap before decoding. */
+    f16 = (uint16_t)((f16 >> 8) | (f16 << 8));
     /* IEEE 754 half: s(1) | exp(5) | frac(10) */
     uint32_t sign     = (f16 >> 15) & 1;
     uint32_t exp      = (f16 >> 10) & 0x1F;
@@ -66,7 +69,13 @@ static int16_t f16_to_fp_scale(uint16_t f16)
         /* inf/nan -> clamp */
         val = 65504.0f;
     } else {
-        val = (1.0f + frac / 1024.0f) * (float)(1 << (exp - 15));
+        float mantissa = 1.0f + frac / 1024.0f;
+        int e = (int)exp - 15;
+        if (e >= 0) {
+            val = mantissa * (float)(1u << (unsigned)e);
+        } else {
+            val = mantissa / (float)(1u << (unsigned)(-e));
+        }
     }
     if (sign) val = -val;
 
@@ -78,32 +87,28 @@ static int16_t f16_to_fp_scale(uint16_t f16)
 }
 
 /* -----------------------------------------------------------------------
- * Q4 dequantize helper
- * packed: pointer to packed byte array (2 nibbles/byte, low nibble first)
+ * Q8 dequantize helper
+ * packed: pointer to int8 array (1 weight per byte, signed)
  * scales: float16 scale per 32-weight block
  * idx:    weight index (0-based)
  * Returns dequantized value in Q8.7
  * ----------------------------------------------------------------------- */
-static inline int16_t q4_dequant(const uint8_t *packed, const uint16_t *scales, int idx)
+static inline int16_t q8_dequant(const int8_t *packed, const uint16_t *scales, int idx)
 {
-    /* Extract nibble */
-    uint8_t byte   = packed[idx >> 1];
-    int     nibble = (idx & 1) ? (byte >> 4) : (byte & 0xF);
-    int     w      = nibble - 8;              /* signed: -8..+7 */
+    int8_t  w     = packed[idx];              /* signed: -128..+127 */
+    int     block = idx / SGAI_Q_BLOCK;
+    int16_t scale = f16_to_fp_scale(scales[block]);
 
-    /* Scale for this block */
-    int     block  = idx / SGAI_Q4_BLOCK;
-    int16_t scale  = f16_to_fp_scale(scales[block]);
-
-    /* w * scale: w is in [-8,7], scale in Q8.7 -> result in Q8.7 */
-    return fp_mul((int16_t)(w * FP_ONE), scale);
+    /* w * scale: w in [-128,127], scale in Q8.7.
+     * Product is Q16.14 (int32); >>7 to get Q8.7. */
+    return (int16_t)(((int32_t)w * (int32_t)scale) >> 7);
 }
 
 /* -----------------------------------------------------------------------
- * RSP-accelerated matrix multiply (Q4 weights x Q8.7 input)
+ * RSP-accelerated matrix multiply (Q8 weights x Q8.7 input)
  *
  * Computes: output[out_dim] = W[out_dim x in_dim] * input[in_dim]
- * W is Q4 packed (out_dim * in_dim / 2 bytes), scales are float16.
+ * W is Q8 packed (out_dim * in_dim bytes, signed int8), scales are float16.
  * output and input are Q8.7 fixed-point int16_t.
  *
  * RSP DMA strategy:
@@ -120,35 +125,34 @@ static inline int16_t q4_dequant(const uint8_t *packed, const uint16_t *scales, 
  * int16 vectors). Here we provide the CPU fallback with DMA hints so
  * the hardware prefetcher can pipeline weight loads.
  * ----------------------------------------------------------------------- */
-void sgai_rsp_matmul_q4(const uint8_t *weights, const uint16_t *scales,
+void sgai_rsp_matmul_q8(const int8_t *weights, const uint16_t *scales,
                           const int16_t *input,   int16_t *output,
                           int in_dim, int out_dim)
 {
-    /* Weight tile size: 128 bytes = 256 Q4 weights = 8 output rows worth
-     * of inner-product for in_dim=128 (128/2 = 64 bytes per row, 2 rows/tile)
-     * We prefetch 2 rows ahead. */
+    /* Weight tile size: 128 bytes = 128 Q8 weights = 1 output row
+     * for in_dim=128. Prefetch 2 rows ahead. */
     const int TILE_BYTES = 128;
 
     for (int o = 0; o < out_dim; o++) {
         /* Prefetch next weight row into D-cache */
         int next_row = o + 2;
         if (next_row < out_dim) {
-            const uint8_t *next_ptr = weights + (next_row * in_dim / 2);
+            const int8_t *next_ptr = weights + (next_row * in_dim);
             data_cache_hit_writeback_invalidate((void *)next_ptr, TILE_BYTES);
         }
 
-        /* Dot product: row o of W (in_dim Q4 weights) dot input (Q8.7) */
+        /* Dot product: row o of W (in_dim Q8 weights) dot input (Q8.7) */
         int32_t acc = 0;
 
         /* Process in blocks of 8 (RSP vector width) */
-        const uint8_t  *row_w = weights + (o * in_dim / 2);
-        const uint16_t *row_s = scales  + (o * in_dim / SGAI_Q4_BLOCK);
+        const int8_t   *row_w = weights + (o * in_dim);
+        const uint16_t *row_s = scales  + (o * in_dim / SGAI_Q_BLOCK);
 
         for (int i = 0; i < in_dim; i += 8) {
             /* Unroll 8 lanes - mirrors RSP vmudh 8-element vector op */
             int lim = (i + 8 < in_dim) ? i + 8 : in_dim;
             for (int j = i; j < lim; j++) {
-                int16_t w_dq = q4_dequant(row_w, row_s, j);
+                int16_t w_dq = q8_dequant(row_w, row_s, j);
                 acc += (int32_t)w_dq * (int32_t)input[j];
             }
         }
@@ -180,12 +184,19 @@ void sgai_softmax_inplace(int16_t *vec, int len)
 
     for (int i = 0; i < lim; i++) {
         int32_t x = (int32_t)(vec[i] - max_val);  /* x <= 0, Q8.7 */
-        /* e^x approximation: clamp at -4.0 (=-512 in Q8.7) */
-        if (x < -512) x = -512;
-        /* Taylor: e^x ≈ 1 + x/128 + (x/128)^2/2 (convert to float domain) */
-        /* In fixed-point: e_fp = FP_ONE + x + (x*x)/(2*FP_ONE) */
-        int32_t e = FP_ONE + x + ((x * x) >> 8);
-        if (e < 1) e = 1;
+        /* Bit-shift exponential: e^x = 2^(x * log2(e))
+         * In Q8.7: e_fp = 128 >> shift,  shift = (-x * 185) >> 14
+         * (185/16384 ≈ log2(e)/128 = 1.4427/128)
+         * This is monotone-decreasing unlike the broken Taylor at large |x|.
+         * At x=0: shift=0, e=128 (=1.0). At x=-512 (=-4.0): shift=5, e=4. */
+        int32_t e;
+        if (x <= -1792) {          /* e^(-14) * 128 ≈ 0 — clamp to 1 */
+            e = 1;
+        } else {
+            int32_t shift = ((int32_t)(-x) * 185) >> 14;
+            e = (int32_t)FP_ONE >> shift;
+            if (e < 1) e = 1;
+        }
         exp_vals[i] = e;
         sum += e;
     }
@@ -230,33 +241,30 @@ static void rms_norm(int16_t *vec, int len)
 }
 
 /* -----------------------------------------------------------------------
- * Embedding lookup (Q4 packed table)
+ * Embedding lookup (Q8 int8 table)
  * Writes SGAI_N_EMBED Q8.7 values into out[]
  * Embedding table immediately follows SGAIHeader in ROM.
  * ----------------------------------------------------------------------- */
 static void embed_lookup(const SGAIHeader *hdr, uint8_t token, int16_t *out)
 {
-    /* Embedding table: vocab * n_embed / 2 bytes, right after header */
-    const uint8_t *emb_table = (const uint8_t *)(hdr + 1);
+    /* Embedding table: vocab * n_embed bytes (int8), right after header */
+    const int8_t *emb_table = (const int8_t *)(hdr + 1);
     int offset = (int)token * SGAI_N_EMBED;
 
-    /* No per-block scales for embedding; use scale=1.0 (FP_ONE) */
-    /* For demo/placeholder, use token-seeded pseudo-embedding */
     if (hdr == NULL) {
         /* Null weights: deterministic hash-based embedding */
         for (int i = 0; i < SGAI_N_EMBED; i++) {
-            /* Cheap hash: mix token with dimension index */
             uint32_t h = (uint32_t)token * 2654435761u + (uint32_t)i * 40503u;
-            out[i] = (int16_t)((int8_t)(h >> 16));  /* [-128, 127] */
+            out[i] = (int16_t)((int8_t)(h >> 16));
         }
         return;
     }
 
     for (int i = 0; i < SGAI_N_EMBED; i++) {
-        int idx = offset + i;
-        uint8_t byte   = emb_table[idx >> 1];
-        int     nibble = (idx & 1) ? (byte >> 4) : (byte & 0xF);
-        out[i] = (int16_t)((nibble - 8) * FP_ONE / 8);  /* scale to Q8.7 */
+        /* Q8 embedding: int8 weight, scale = 1/8 baked in during export
+         * Python exports emb as int8 with max_abs clamped to ~1.0 range
+         * Convert to Q8.7: out = w * FP_ONE / 8 (matches Python's /8 scale) */
+        out[i] = (int16_t)(((int32_t)emb_table[offset + i] * FP_ONE) / 8);
     }
 }
 
@@ -290,9 +298,9 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
     rms_norm(x, SGAI_N_EMBED);
 
     /* Project Q, K, V */
-    sgai_rsp_matmul_q4(layer->wq, layer->sq, x, q,     SGAI_N_EMBED, SGAI_N_EMBED);
-    sgai_rsp_matmul_q4(layer->wk, layer->sk, x, k_cur, SGAI_N_EMBED, SGAI_N_EMBED);
-    sgai_rsp_matmul_q4(layer->wv, layer->sv, x, v_cur, SGAI_N_EMBED, SGAI_N_EMBED);
+    sgai_rsp_matmul_q8(layer->wq, layer->sq, x, q,     SGAI_N_EMBED, SGAI_N_EMBED);
+    sgai_rsp_matmul_q8(layer->wk, layer->sk, x, k_cur, SGAI_N_EMBED, SGAI_N_EMBED);
+    sgai_rsp_matmul_q8(layer->wv, layer->sv, x, v_cur, SGAI_N_EMBED, SGAI_N_EMBED);
 
     /* Store K, V in cache at current position */
     if (pos < SGAI_CTX) {
@@ -340,7 +348,7 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
 
     /* Output projection Wo */
     static int16_t proj_out[SGAI_N_EMBED];
-    sgai_rsp_matmul_q4(layer->wo, layer->so, attn_out, proj_out,
+    sgai_rsp_matmul_q8(layer->wo, layer->so, attn_out, proj_out,
                         SGAI_N_EMBED, SGAI_N_EMBED);
 
     /* Residual add: x = residual + proj_out */
@@ -355,7 +363,7 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
     rms_norm(x, SGAI_N_EMBED);
 
     /* ff1: 128 -> 512 */
-    sgai_rsp_matmul_q4(layer->wff1, layer->sff1, x, ff_buf,
+    sgai_rsp_matmul_q8(layer->wff1, layer->sff1, x, ff_buf,
                         SGAI_N_EMBED, SGAI_N_EMBED * 4);
 
     /* ReLU */
@@ -365,7 +373,7 @@ static void attention_layer(const SGAILayer *layer, SGAIKVCache *kv,
 
     /* ff2: 512 -> 128 */
     static int16_t ff_out[SGAI_N_EMBED];
-    sgai_rsp_matmul_q4(layer->wff2, layer->sff2, ff_buf, ff_out,
+    sgai_rsp_matmul_q8(layer->wff2, layer->sff2, ff_buf, ff_out,
                         SGAI_N_EMBED * 4, SGAI_N_EMBED);
 
     /* Residual add */
@@ -395,16 +403,14 @@ static void project_to_logits(const SGAIHeader *hdr, const int16_t *x,
         return;
     }
 
-    /* Tied unembedding: use embedding table rows as projection vectors */
-    const uint8_t *emb_table = (const uint8_t *)(hdr + 1);
+    /* Tied unembedding: use embedding table rows as projection vectors (Q8) */
+    const int8_t *emb_table = (const int8_t *)(hdr + 1);
     for (int v = 0; v < SGAI_VOCAB; v++) {
         int32_t acc = 0;
         int offset = v * SGAI_N_EMBED;
         for (int i = 0; i < SGAI_N_EMBED; i++) {
-            int idx = offset + i;
-            uint8_t byte   = emb_table[idx >> 1];
-            int     nibble = (idx & 1) ? (byte >> 4) : (byte & 0xF);
-            int16_t e_val  = (int16_t)((nibble - 8) * FP_ONE / 8);
+            /* e_val in Q8.7 (same scale as embed_lookup) */
+            int16_t e_val = (int16_t)(((int32_t)emb_table[offset + i] * FP_ONE) / 8);
             acc += (int32_t)e_val * (int32_t)x[i];
         }
         logits[v] = fp_add_sat(acc >> 7);
@@ -416,50 +422,92 @@ static void project_to_logits(const SGAIHeader *hdr, const int16_t *x,
  * temperature_q8: temperature in Q8 (256 = 1.0). Lower = more greedy.
  * Returns sampled token index.
  * ----------------------------------------------------------------------- */
-static uint8_t sample_logits(const int16_t *logits, uint32_t temperature_q8)
+/* Hard post-softmax exclusion: recent tokens are zeroed AFTER softmax.
+ * This guarantees no repetition regardless of logit magnitude — a token
+ * with logit +20 still gets probability 0 once we hard-zero it.
+ * hist[0]=most recent, hist[7]=oldest. Window of 8 prevents cycles
+ * up to length 8 (covers "I am Sop" and similar short stuck loops). */
+static uint8_t sample_logits(const int16_t *logits, uint32_t temperature_q8,
+                               const uint8_t *hist, int n_hist)
 {
     static int16_t probs[SGAI_VOCAB];
     memcpy(probs, logits, SGAI_VOCAB * sizeof(int16_t));
 
     if (temperature_q8 == 0) {
-        /* Greedy: return argmax */
-        int best = 0;
-        for (int i = 1; i < SGAI_VOCAB; i++) {
-            if (probs[i] > probs[best]) best = i;
+        /* Greedy: argmax over printable ASCII 32-126, excluding recent tokens */
+        int best = -1;
+        for (int i = 32; i <= 126; i++) {
+            int skip = 0;
+            for (int h = 0; h < n_hist && h < 8; h++)
+                if (hist[h] == (uint8_t)i) { skip = 1; break; }
+            if (skip) continue;
+            if (best < 0 || probs[i] > probs[best]) best = i;
         }
-        return (uint8_t)best;
+        return (best >= 0) ? (uint8_t)best : 'a';
     }
 
-    /* Apply temperature: logits /= temp
-     * temp_q8=256 -> divide by 1, temp_q8=128 -> divide by 0.5 (sharpen) */
+    /* Apply temperature: T = temp_q8/256.
+     * temp_q8=350 -> T~1.37 (softer/more diverse for overfitted model) */
     for (int i = 0; i < SGAI_VOCAB; i++) {
         int32_t scaled = ((int32_t)probs[i] * 256) / (int32_t)temperature_q8;
         probs[i] = fp_add_sat(scaled);
     }
 
-    /* Softmax to get probabilities */
+    /* Softmax over full vocab */
     sgai_softmax_inplace(probs, SGAI_VOCAB);
 
-    /* Multinomial sample using timer as RNG seed */
-    /* R4300 has no hardware RNG; use MIPS Count register via timer */
+    /* Step 1: zero non-printable tokens (outside ASCII 32-126) */
+    for (int i = 0; i < SGAI_VOCAB; i++) {
+        if (i < 32 || i > 126) probs[i] = 0;
+    }
+
+    /* Step 2: hard-zero recent tokens — guaranteed exclusion.
+     * Zeroing AFTER softmax means even a +20 logit token gets prob=0.
+     * Also zero any token that appears 2+ times in the window (frequency cap)
+     * to break m→a→m→a style 2-token cycles with matching logit pairs. */
+    for (int h = 0; h < n_hist && h < 16; h++) {
+        uint8_t t = hist[h];
+        if (t >= 32 && t <= 126) probs[t] = 0;
+    }
+    /* Frequency cap: count occurrences, zero any token seen >= 2 times */
+    {
+        uint8_t freq[256];
+        memset(freq, 0, sizeof(freq));
+        for (int h = 0; h < n_hist && h < 16; h++) freq[hist[h]]++;
+        for (int i = 32; i <= 126; i++)
+            if (freq[i] >= 2) probs[i] = 0;
+    }
+
+    /* Multinomial sample using MIPS CP0 Count register as RNG seed */
     uint32_t rng;
-    asm volatile("mfc0 %0, $9" : "=r"(rng));  /* Read CP0 Count register */
+    asm volatile("mfc0 %0, $9" : "=r"(rng));
     rng ^= rng >> 16;
     rng *= 0x45d9f3b;
     rng ^= rng >> 16;
 
-    /* Cumulative sum sampling */
+    /* Cumulative sum sampling over printable range */
     int32_t r = (int32_t)(rng & 0x7FFF);  /* [0, 32767] */
     int32_t csum = 0;
     int32_t total = 0;
-    for (int i = 0; i < SGAI_VOCAB; i++) total += probs[i];
-    if (total == 0) total = 1;
+    for (int i = 32; i <= 126; i++) total += probs[i];
+    if (total == 0) {
+        /* All candidates exhausted — scan printable range for first char not
+         * in recent history. With 94 printable chars and a 16-token window
+         * this almost always succeeds quickly. */
+        for (int i = 32; i <= 126; i++) {
+            int in_hist = 0;
+            for (int h = 0; h < n_hist && h < 16; h++)
+                if (hist[h] == (uint8_t)i) { in_hist = 1; break; }
+            if (!in_hist) return (uint8_t)i;
+        }
+        return ' ';   /* absolute last resort */
+    }
 
-    for (int i = 0; i < SGAI_VOCAB; i++) {
+    for (int i = 32; i <= 126; i++) {
         csum += (int32_t)probs[i] * 32767 / total;
         if (r < csum) return (uint8_t)i;
     }
-    return SGAI_VOCAB - 1;
+    return (uint8_t)(32 + (rng & 31));
 }
 
 /* -----------------------------------------------------------------------
@@ -472,7 +520,13 @@ void sgai_init(SGAIState *state, const void *rom_weights)
 
     if (rom_weights != NULL) {
         const SGAIHeader *hdr = (const SGAIHeader *)rom_weights;
-        if (hdr->magic == SGAI_MAGIC) {
+        /* Magic is written LE by Python; N64 reads 4 bytes as BE uint32.
+         * Python: struct.pack('<I', 0x53454149) -> bytes [0x49,0x41,0x45,0x53]
+         * N64 reads as BE: 0x49414553  (byte-swapped from SGAI_MAGIC)       */
+        uint32_t m = hdr->magic;
+        uint32_t m_host = ((m & 0xFF000000u) >> 24) | ((m & 0x00FF0000u) >> 8)
+                        | ((m & 0x0000FF00u) <<  8) | ((m & 0x000000FFu) << 24);
+        if (m_host == SGAI_MAGIC) {
             state->weights = hdr;
             state->is_loaded = 1;
         }
@@ -497,6 +551,8 @@ void sgai_reset(SGAIState *state)
     state->seq_len = 0;
     memset(state->x, 0, sizeof(state->x));
     memset(state->logits, 0, sizeof(state->logits));
+    memset(state->penalty_hist, 0, sizeof(state->penalty_hist));
+    state->penalty_n = 0;
 }
 
 /*
@@ -516,10 +572,10 @@ uint8_t sgai_next_token(SGAIState *state, uint8_t input_token,
     /* 2. Run transformer layers */
     if (state->is_loaded && state->weights != NULL) {
         /* Weights layout after header:
-         * - Embedding table: SGAI_VOCAB * SGAI_N_EMBED / 2 bytes
+         * - Embedding table: SGAI_VOCAB * SGAI_N_EMBED bytes (Q8 int8)
          * - n_layers SGAILayer structs */
         const uint8_t *after_hdr = (const uint8_t *)(state->weights + 1);
-        size_t emb_table_bytes = SGAI_VOCAB * SGAI_N_EMBED / 2;
+        size_t emb_table_bytes = SGAI_VOCAB * SGAI_N_EMBED;  /* Q8: 1 byte per weight */
         const SGAILayer *layers = (const SGAILayer *)(after_hdr + emb_table_bytes);
 
         for (int l = 0; l < SGAI_N_LAYERS; l++) {
@@ -540,8 +596,19 @@ uint8_t sgai_next_token(SGAIState *state, uint8_t input_token,
     /* 4. Project to logits */
     project_to_logits(state->weights, state->x, state->logits);
 
-    /* 5. Sample next token */
-    uint8_t next_tok = sample_logits(state->logits, temperature_q8);
+    /* 5. Sample with window-based repetition penalty */
+    uint8_t next_tok = sample_logits(state->logits, temperature_q8,
+                                      state->penalty_hist, (int)state->penalty_n);
+
+    /* Update penalty history only during generation (temp > 0).
+     * Shift array right, insert new token at [0]. */
+    if (temperature_q8 > 0) {
+        int new_n = ((int)state->penalty_n < 16) ? (int)state->penalty_n + 1 : 16;
+        for (int i = new_n - 1; i > 0; i--)
+            state->penalty_hist[i] = state->penalty_hist[i - 1];
+        state->penalty_hist[0] = next_tok;
+        state->penalty_n = (uint8_t)new_n;
+    }
 
     /* 6. Advance position in KV cache */
     if (state->kv->pos < SGAI_CTX - 1) {
