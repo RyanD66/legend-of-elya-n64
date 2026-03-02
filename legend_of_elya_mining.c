@@ -18,6 +18,8 @@
 #include <math.h>
 #include "nano_gpt.h"
 
+#include "n64_attest.h"
+
 // ─── Game State ───────────────────────────────────────────────────────────────
 
 typedef enum {
@@ -26,6 +28,7 @@ typedef enum {
     STATE_DUNGEON,
     STATE_DIALOG,
     STATE_GENERATING,
+    STATE_ATTEST,        // RustChain mining attestation
 } GameState;
 
 typedef struct {
@@ -636,6 +639,7 @@ static void draw_text(surface_t *disp) {
             graphics_draw_text(disp,  72, 118, "[Sophia AI: Demo Mode]");
         graphics_draw_text(disp,  80, 155, "Press START to enter");
         graphics_draw_text(disp, 104, 170, "the dungeon...");
+        graphics_draw_text(disp,  68, 200, "[B] RustChain Mining");
         break;
 
     case STATE_DUNGEON:
@@ -811,6 +815,7 @@ static void handle_input(void) {
         break;
     case STATE_TITLE:
         if (k.c[0].start || k.c[0].A) G.state = STATE_DUNGEON;
+        if (k.c[0].B) { attest_start(); G.state = STATE_ATTEST; }
         break;
     case STATE_DUNGEON:
         if (k.c[0].A) start_dialog();
@@ -820,6 +825,10 @@ static void handle_input(void) {
         if (k.c[0].B) G.state = STATE_DUNGEON;
         break;
     case STATE_GENERATING:
+        break;
+    case STATE_ATTEST:
+        if (!attest_handle_input(&k))
+            G.state = STATE_TITLE;  // B pressed — back to title
         break;
     }
 }
@@ -882,12 +891,19 @@ int main(void) {
         if (G.state == STATE_GENERATING)
             update_generating_step();
 
+        // Per-frame mining update
+        if (G.state == STATE_ATTEST)
+            attest_update(G.frame);
+
         // Get ONE surface for this frame
         surface_t *disp = display_get();
 
         // ── RDP graphics pass ──────────────────────────────────────────────
         rdpq_attach(disp, NULL);
 
+        if (G.state == STATE_ATTEST) {
+            attest_draw_scene(G.frame);
+        } else
         if (G.state == STATE_ANNIVERSARY) {
             scene_anniversary();
         } else if (G.state == STATE_TITLE) {
@@ -904,6 +920,9 @@ int main(void) {
         rdpq_detach_wait();
 
         // ── CPU text pass (same surface, no buffer switch → no flicker) ───
+        if (G.state == STATE_ATTEST)
+            attest_draw_text(disp);
+        else
         draw_text(disp);
 
         display_show(disp);
